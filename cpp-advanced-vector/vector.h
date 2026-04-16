@@ -31,9 +31,6 @@ public:
 
     RawMemory& operator=(RawMemory&& other) noexcept {
         if (this != &other) {
-            Deallocate(buffer_);
-            buffer_ = nullptr;
-            capacity_ = 0;
             Swap(other);
         }
         return *this;
@@ -121,15 +118,9 @@ public:
             if (rhs.size_ > data_.Capacity()) {
                 Vector rhs_copy(rhs);
                 Swap(rhs_copy);
-            } else {
-                if (rhs.size_ < size_) {
-                    std::copy(rhs.data_.GetAddress(), rhs.data_.GetAddress() + rhs.size_, data_.GetAddress());
-                    std::destroy_n(data_.GetAddress() + rhs.size_, size_ - rhs.size_);
-                } else {
-                    std::copy(rhs.data_.GetAddress(), rhs.data_.GetAddress() + size_, data_.GetAddress());
-                    std::uninitialized_copy_n(rhs.data_.GetAddress() + size_, rhs.size_ - size_, data_.GetAddress() + size_);
-                }
-                size_ = rhs.size_;
+            }
+            else {
+                AssignFromNonGrowing(rhs);
             }
         }
         return *this;
@@ -154,7 +145,8 @@ public:
     void Resize(size_t new_size) {
         if (new_size < size_) {
             std::destroy_n(data_.GetAddress() + new_size, size_ - new_size);
-        } else if (new_size > size_) {
+        }
+        else if (new_size > size_) {
             Reserve(new_size);
             std::uninitialized_value_construct_n(data_.GetAddress() + size_, new_size - size_);
         }
@@ -174,18 +166,20 @@ public:
         if (size_ == Capacity()) {
             size_t new_capacity = (size_ == 0 ? 1 : size_ * 2);
             RawMemory<T> new_data(new_capacity);
-            
+
             T* new_item_ptr = new (new_data + size_) T(std::forward<Args>(args)...);
 
             try {
                 ReallocateMove(new_data.GetAddress());
-            } catch (...) {
+            }
+            catch (...) {
                 std::destroy_at(new_item_ptr);
                 throw;
             }
 
             data_.Swap(new_data);
-        } else {
+        }
+        else {
             new (data_ + size_) T(std::forward<Args>(args)...);
         }
         return data_[size_++];
@@ -247,6 +241,8 @@ public:
     template <typename... Args>
     iterator Emplace(const_iterator pos, Args&&... args) {
         iterator it = const_cast<iterator>(pos);
+        assert(it >= begin() && it <= end());
+
         size_t index = it - begin();
 
         if (index == size_) {
@@ -259,17 +255,17 @@ public:
             size_t new_size = 0;
 
             try {
-                for (size_t i = 0; i < index; ++i) {
-                    new (new_data + i) T(std::move_if_noexcept(data_[i]));
-                    ++new_size;
-                }
+                std::uninitialized_move_n(data_.GetAddress(), index, new_data.GetAddress());
+                new_size += index;
+
                 new (new_data + index) T(std::forward<Args>(args)...);
                 ++new_size;
-                for (size_t i = index; i < size_; ++i) {
-                    new (new_data + i + 1) T(std::move_if_noexcept(data_[i]));
-                    ++new_size;
-                }
-            } catch (...) {
+
+                std::uninitialized_move_n(data_.GetAddress() + index, size_ - index,
+                    new_data.GetAddress() + index + 1);
+                new_size += (size_ - index);
+            }
+            catch (...) {
                 std::destroy_n(new_data.GetAddress(), new_size);
                 throw;
             }
@@ -281,10 +277,10 @@ public:
         }
 
         T* const address = data_.GetAddress();
-        
+
         bool use_temp = false;
         alignas(T) unsigned char temp_buffer[sizeof(T)];
-        
+
         if constexpr (sizeof...(Args) == 1) {
             auto check_and_copy_arg = [&](auto&& arg) {
                 using Arg = decltype(arg);
@@ -294,7 +290,7 @@ public:
                         const void* arg_addr = static_cast<const void*>(&arg);
                         const void* buf_start = static_cast<const void*>(address);
                         const void* buf_end = static_cast<const void*>(address + size_);
-                        
+
                         if (arg_addr >= buf_start && arg_addr < buf_end) {
                             if constexpr (std::is_copy_constructible_v<T>) {
                                 new (temp_buffer) T(arg);
@@ -303,26 +299,25 @@ public:
                         }
                     }
                 }
-            };
+                };
             check_and_copy_arg(std::get<0>(std::forward_as_tuple(std::forward<Args>(args)...)));
         }
-        
+
         new (address + size_) T(std::move_if_noexcept(address[size_ - 1]));
         ++size_;
 
         try {
-            for (size_t i = size_ - 1; i > index; --i) {
-                address[i] = std::move_if_noexcept(address[i - 1]);
-            }
-
+            std::move_backward(address + index, address + size_ - 1, address + size_);
             std::destroy_at(address + index);
 
             if (use_temp) {
                 new (address + index) T(std::move(*reinterpret_cast<T*>(temp_buffer)));
-            } else {
+            }
+            else {
                 new (address + index) T(std::forward<Args>(args)...);
             }
-        } catch (...) {
+        }
+        catch (...) {
             std::destroy_at(address + size_ - 1);
             --size_;
             if (use_temp) {
@@ -330,7 +325,7 @@ public:
             }
             throw;
         }
-        
+
         if (use_temp) {
             std::destroy_at(reinterpret_cast<T*>(temp_buffer));
         }
@@ -348,22 +343,34 @@ public:
 
     iterator Erase(const_iterator pos) {
         iterator it = const_cast<iterator>(pos);
-        size_t index = it - begin();
-        assert(index < size_);
+        assert(it >= begin() && it < end());
 
-        for (size_t i = index; i + 1 < size_; ++i) {
-            data_[i] = std::move_if_noexcept(data_[i + 1]);
-        }
+        std::move(it + 1, end(), it);
         std::destroy_at(data_ + size_ - 1);
         --size_;
         return it;
     }
 
 private:
+    void AssignFromNonGrowing(const Vector& rhs) {
+        const size_t copy_count = std::min(size_, rhs.size_);
+        std::copy_n(rhs.data_.GetAddress(), copy_count, data_.GetAddress());
+
+        if (rhs.size_ < size_) {
+            std::destroy_n(data_.GetAddress() + rhs.size_, size_ - rhs.size_);
+        }
+        else if (rhs.size_ > size_) {
+            std::uninitialized_copy_n(rhs.data_.GetAddress() + size_, rhs.size_ - size_,
+                data_.GetAddress() + size_);
+        }
+        size_ = rhs.size_;
+    }
+
     void ReallocateMove(T* new_buf) {
         if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>) {
             std::uninitialized_move_n(data_.GetAddress(), size_, new_buf);
-        } else {
+        }
+        else {
             std::uninitialized_copy_n(data_.GetAddress(), size_, new_buf);
         }
         std::destroy_n(data_.GetAddress(), size_);
